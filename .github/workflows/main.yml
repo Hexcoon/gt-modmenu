@@ -1,0 +1,381 @@
+name: build
+on: [workflow_dispatch]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Tulis file project
+        run: |
+          mkdir -p jni module/META-INF/com/google/android
+          cat > CMakeLists.txt <<'MM_EOF'
+          cmake_minimum_required(VERSION 3.18)
+          project(modmenu CXX)
+          set(CMAKE_CXX_STANDARD 17)
+          set(CMAKE_CXX_VISIBILITY_PRESET hidden)
+
+          set(DOBBY_GENERATE_SHARED OFF CACHE BOOL "" FORCE)
+          set(DOBBY_DEBUG OFF CACHE BOOL "" FORCE)
+          add_subdirectory(third_party/Dobby ${CMAKE_BINARY_DIR}/dobby EXCLUDE_FROM_ALL)
+
+          set(IMGUI third_party/imgui)
+          add_library(modmenu SHARED
+            jni/main.cpp
+            ${IMGUI}/imgui.cpp ${IMGUI}/imgui_draw.cpp ${IMGUI}/imgui_tables.cpp ${IMGUI}/imgui_widgets.cpp
+            ${IMGUI}/backends/imgui_impl_opengl3.cpp)
+          target_compile_definitions(modmenu PRIVATE IMGUI_IMPL_OPENGL_ES3)
+          target_include_directories(modmenu PRIVATE jni ${IMGUI} ${IMGUI}/backends third_party/Dobby/include)
+          target_link_libraries(modmenu dobby log EGL GLESv3 android)
+          MM_EOF
+          cat > jni/main.cpp <<'MM_EOF'
+          // Zygisk + ImGui overlay (input via hook JNI UnityPlayer.nativeInjectEvent,
+          // tidak bergantung pada internal Android seperti InputConsumer).
+          #include <jni.h>
+          #include <android/log.h>
+          #include <EGL/egl.h>
+          #include <pthread.h>
+          #include <unistd.h>
+          #include <cfloat>
+          #include <cstring>
+          #include <mutex>
+          #include <vector>
+          #include <atomic>
+          #include <algorithm>
+          #include <string>
+          #include <cstdio>
+          #include <cctype>
+
+          #include "zygisk.hpp"
+          #include "dobby.h"
+          #include "imgui.h"
+          #include "imgui_impl_opengl3.h"
+          #include "config.h"
+
+          #define LOG(...) __android_log_print(ANDROID_LOG_INFO, "ModMenu", __VA_ARGS__)
+
+          // ---------------- state fitur ----------------
+          static bool  g_speedOn = false;
+          static float g_speedMul = 1.5f;
+          static bool  g_dmgOn = false;
+          static float g_dmgMul = 2.0f;
+
+          // ---------------- antrian sentuhan ----------------
+          struct Touch { int type; float x, y; };      // 0=move 1=down 2=up
+          static std::mutex g_mu;
+          static std::vector<Touch> g_q;
+          static std::atomic<bool> g_wantMouse{false};
+          static std::atomic<bool> g_ready{false};
+
+          // ---------------- hook input (JNI) ----------------
+          static jboolean (*orig_inject)(JNIEnv*, jobject, jobject) = nullptr;
+          static jclass g_mev = nullptr;
+          static jmethodID m_act, m_x, m_y;
+
+          static void init_jni(JNIEnv* env) {
+              jclass c = env->FindClass("android/view/MotionEvent");
+              g_mev = (jclass)env->NewGlobalRef(c);
+              m_act = env->GetMethodID(c, "getActionMasked", "()I");
+              m_x   = env->GetMethodID(c, "getX", "()F");
+              m_y   = env->GetMethodID(c, "getY", "()F");
+          }
+
+          static jboolean hook_inject(JNIEnv* env, jobject thiz, jobject ev) {
+              if (!orig_inject) return JNI_FALSE;
+              if (ev && g_ready.load()) {
+                  if (!g_mev) init_jni(env);
+                  if (env->IsInstanceOf(ev, g_mev)) {
+                      int a = env->CallIntMethod(ev, m_act);
+                      float x = env->CallFloatMethod(ev, m_x);
+                      float y = env->CallFloatMethod(ev, m_y);
+                      int t = -1;
+                      if (a == 0 || a == 5) t = 1;                    // DOWN / POINTER_DOWN
+                      else if (a == 1 || a == 3 || a == 6) t = 2;     // UP / CANCEL / POINTER_UP
+                      else if (a == 2) t = 0;                         // MOVE
+                      if (t >= 0) {
+                          std::lock_guard<std::mutex> l(g_mu);
+                          g_q.push_back({t, x, y});
+                      }
+                      if (g_wantMouse.load()) return JNI_TRUE;        // sentuhan dipakai menu
+                  }
+              }
+              return orig_inject(env, thiz, ev);
+          }
+
+          // ---------------- render ----------------
+          static EGLBoolean (*orig_swap)(EGLDisplay, EGLSurface) = nullptr;
+
+          static void draw_ui() {
+              ImGui::SetNextWindowSize(ImVec2(0, 0), ImGuiCond_FirstUseEver);
+              ImGui::SetNextWindowPos(ImVec2(40, 40), ImGuiCond_FirstUseEver);
+              ImGui::Begin("Mod Menu");
+              ImGui::Checkbox("Speed multiplier", &g_speedOn);
+              ImGui::SliderFloat("x##s", &g_speedMul, 1.0f, 5.0f);
+              ImGui::Checkbox("Damage multiplier", &g_dmgOn);
+              ImGui::SliderFloat("x##d", &g_dmgMul, 1.0f, 10.0f);
+              ImGui::TextDisabled("Pakai di mode solo/offline saja");
+              ImGui::End();
+          }
+
+          static EGLBoolean hook_swap(EGLDisplay dpy, EGLSurface surf) {
+              static bool inited = false;
+              EGLint w = 0, h = 0;
+              eglQuerySurface(dpy, surf, EGL_WIDTH, &w);
+              eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
+              if (w < 200 || h < 200) return orig_swap(dpy, surf);
+
+              if (!inited) {
+                  ImGui::CreateContext();
+                  ImGuiIO& io = ImGui::GetIO();
+                  io.IniFilename = nullptr;
+                  float s = std::clamp(std::max(w, h) / 700.0f, 1.5f, 4.0f);
+                  ImGui::StyleColorsDark();
+                  ImGui::GetStyle().ScaleAllSizes(s);
+                  io.FontGlobalScale = s;
+                  ImGui_ImplOpenGL3_Init("#version 300 es");
+                  inited = true;
+                  g_ready = true;
+              }
+
+              ImGuiIO& io = ImGui::GetIO();
+              io.DisplaySize = ImVec2((float)w, (float)h);
+
+              std::vector<Touch> q;
+              { std::lock_guard<std::mutex> l(g_mu); q.swap(g_q); }
+              for (auto& t : q) {
+                  io.AddMousePosEvent(t.x, t.y);
+                  if (t.type == 1) io.AddMouseButtonEvent(0, true);
+                  if (t.type == 2) { io.AddMouseButtonEvent(0, false); io.AddMousePosEvent(-FLT_MAX, -FLT_MAX); }
+              }
+
+              ImGui_ImplOpenGL3_NewFrame();
+              ImGui::NewFrame();
+              draw_ui();
+              ImGui::Render();
+              g_wantMouse = io.WantCaptureMouse;
+              ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+              return orig_swap(dpy, surf);
+          }
+
+          // ---------------- il2cpp ----------------
+          #define IL(n) DobbySymbolResolver("libil2cpp.so", n)
+
+          static void* il2_find_method(const char* ns, const char* cls, const char* m, int argc) {
+              auto domain_get = (void* (*)())IL("il2cpp_domain_get");
+              auto get_asms   = (void** (*)(void*, size_t*))IL("il2cpp_domain_get_assemblies");
+              auto asm_img    = (void* (*)(void*))IL("il2cpp_assembly_get_image");
+              auto cfn        = (void* (*)(void*, const char*, const char*))IL("il2cpp_class_from_name");
+              auto mfn        = (void* (*)(void*, const char*, int))IL("il2cpp_class_get_method_from_name");
+              if (!domain_get || !get_asms || !asm_img || !cfn || !mfn) return nullptr;
+              size_t n = 0;
+              void** a = get_asms(domain_get(), &n);
+              for (size_t i = 0; i < n; i++) {
+                  void* k = cfn(asm_img(a[i]), ns, cls);
+                  if (!k) continue;
+                  void* mi = mfn(k, m, argc);
+                  if (mi) return *(void**)mi;     // MethodInfo.methodPointer
+              }
+              return nullptr;
+          }
+
+
+          // ---------------- pemindai nama method ----------------
+          static bool has_kw(const std::string& hay) {
+              std::string h = hay;
+              for (auto& c : h) c = (char)tolower((unsigned char)c);
+              std::string kws = SCAN_KEYWORDS;
+              size_t pos = 0;
+              while (pos <= kws.size()) {
+                  size_t e = kws.find(',', pos);
+                  if (e == std::string::npos) e = kws.size();
+                  std::string k = kws.substr(pos, e - pos);
+                  if (!k.empty() && h.find(k) != std::string::npos) return true;
+                  pos = e + 1;
+              }
+              return false;
+          }
+
+          static void scan_methods() {
+              if (!SCAN_KEYWORDS[0]) return;
+              auto domain_get = (void* (*)())IL("il2cpp_domain_get");
+              auto get_asms   = (void** (*)(void*, size_t*))IL("il2cpp_domain_get_assemblies");
+              auto asm_img    = (void* (*)(void*))IL("il2cpp_assembly_get_image");
+              auto img_cnt    = (size_t (*)(void*))IL("il2cpp_image_get_class_count");
+              auto img_cls    = (void* (*)(void*, size_t))IL("il2cpp_image_get_class");
+              auto cls_name   = (const char* (*)(void*))IL("il2cpp_class_get_name");
+              auto cls_ns     = (const char* (*)(void*))IL("il2cpp_class_get_namespace");
+              auto cls_meths  = (void* (*)(void*, void**))IL("il2cpp_class_get_methods");
+              auto m_name     = (const char* (*)(void*))IL("il2cpp_method_get_name");
+              auto m_argc     = (unsigned (*)(void*))IL("il2cpp_method_get_param_count");
+              auto m_ret      = (void* (*)(void*))IL("il2cpp_method_get_return_type");
+              auto t_name     = (const char* (*)(void*))IL("il2cpp_type_get_name");
+              if (!domain_get || !get_asms || !asm_img || !img_cnt || !img_cls || !cls_name ||
+                  !cls_ns || !cls_meths || !m_name || !m_argc || !m_ret || !t_name) {
+                  LOG("scan: fungsi il2cpp tidak lengkap"); return;
+              }
+              FILE* f = fopen("/data/data/" TARGET_PACKAGE "/files/scan.txt", "w");
+              size_t n = 0, hits = 0;
+              void** a = get_asms(domain_get(), &n);
+              for (size_t i = 0; i < n; i++) {
+                  void* img = asm_img(a[i]);
+                  size_t cc = img_cnt(img);
+                  for (size_t c = 0; c < cc; c++) {
+                      void* k = img_cls(img, c);
+                      if (!k) continue;
+                      void* it = nullptr;
+                      while (void* mi = cls_meths(k, &it)) {
+                          const char* mn = m_name(mi);
+                          const char* cn = cls_name(k);
+                          if (!mn || !cn) continue;
+                          if (!has_kw(std::string(mn))) continue;
+                          const char* rt = t_name(m_ret(mi));
+                          char line[512];
+                          snprintf(line, sizeof line, "%s.%s::%s(%u) -> %s", cls_ns(k), cn, mn, m_argc(mi), rt ? rt : "?");
+                          LOG("SCAN %s", line);
+                          if (f) fprintf(f, "%s\n", line);
+                          if (++hits >= 3000) goto done;
+                      }
+                  }
+              }
+          done:
+              if (f) fclose(f);
+              LOG("scan selesai: %zu hasil", hits);
+          }
+
+          static float (*old_speed)(void*) = nullptr;
+          static float new_speed(void* self) {
+              float v = old_speed(self);
+              return g_speedOn ? v * g_speedMul : v;
+          }
+
+          static float (*old_dmg)(void*) = nullptr;
+          static float new_dmg(void* self) {
+              float v = old_dmg(self);
+              return g_dmgOn ? v * g_dmgMul : v;
+          }
+
+          static void* worker(void*) {
+              // pasang hook render lebih dulu
+              DobbyHook((void*)eglSwapBuffers, (void*)hook_swap, (void**)&orig_swap);
+
+              // tunggu il2cpp siap
+              typedef void* (*fn_domain)();
+              typedef void* (*fn_attach)(void*);
+              fn_domain domain_get = nullptr;
+              for (int i = 0; i < 240; i++) {
+                  domain_get = (fn_domain)IL("il2cpp_domain_get");
+                  if (domain_get && domain_get()) break;
+                  usleep(500000);
+              }
+              if (!domain_get || !domain_get()) { LOG("il2cpp tidak ditemukan"); return nullptr; }
+              sleep(8);                                   // beri waktu assembly selesai dimuat
+              auto attach = (fn_attach)IL("il2cpp_thread_attach");
+              if (attach) attach(domain_get());
+
+              scan_methods();
+
+              if (SPEED_CLASS[0]) {
+                  void* p = il2_find_method(SPEED_NS, SPEED_CLASS, SPEED_METHOD, 0);
+                  if (p) { DobbyHook(p, (void*)new_speed, (void**)&old_speed); LOG("speed hook ok"); }
+                  else LOG("method speed tidak ditemukan");
+              }
+              if (DMG_CLASS[0]) {
+                  void* p = il2_find_method(DMG_NS, DMG_CLASS, DMG_METHOD, 0);
+                  if (p) { DobbyHook(p, (void*)new_dmg, (void**)&old_dmg); LOG("damage hook ok"); }
+                  else LOG("method damage tidak ditemukan");
+              }
+              return nullptr;
+          }
+
+          // ---------------- modul zygisk ----------------
+          class Mod : public zygisk::ModuleBase {
+          public:
+              void onLoad(zygisk::Api* api, JNIEnv* env) override { api_ = api; env_ = env; }
+
+              void preAppSpecialize(zygisk::AppSpecializeArgs* args) override {
+                  const char* name = env_->GetStringUTFChars(args->nice_name, nullptr);
+                  target_ = name && strcmp(name, TARGET_PACKAGE) == 0;
+                  if (name) env_->ReleaseStringUTFChars(args->nice_name, name);
+                  if (!target_) api_->setOption(zygisk::Option::DLCLOSE_MODULE_LIBRARY);
+              }
+
+              void postAppSpecialize(const zygisk::AppSpecializeArgs*) override {
+                  if (!target_) return;
+                  // harus static: fnPtr asli ditulis balik saat Unity melakukan RegisterNatives
+                  static JNINativeMethod m[] = {
+                      {"nativeInjectEvent", "(Landroid/view/InputEvent;)Z", (void*)hook_inject}
+                  };
+                  api_->hookJniNativeMethods(env_, "com/unity3d/player/UnityPlayer", m, 1);
+                  orig_inject = (jboolean (*)(JNIEnv*, jobject, jobject))m[0].fnPtr;
+                  pthread_t t;
+                  pthread_create(&t, nullptr, worker, nullptr);
+              }
+
+          private:
+              zygisk::Api* api_ = nullptr;
+              JNIEnv* env_ = nullptr;
+              bool target_ = false;
+          };
+
+          REGISTER_ZYGISK_MODULE(Mod)
+          MM_EOF
+          cat > jni/config.h <<'MM_EOF'
+          #pragma once
+          // Paket game target
+          #define TARGET_PACKAGE "com.kakaogames.gdts"
+
+          // Fitur contoh: hook method float tanpa argumen (mis. get_moveSpeed).
+          // Isi dari dump.cs (hasil Il2CppDumper) game versi yang kamu pakai.
+          // Kosongkan SPEED_CLASS untuk menonaktifkan fitur ini.
+          #define SPEED_NS "" // namespace, boleh kosong
+          #define SPEED_CLASS "" // nama class
+          #define SPEED_METHOD "" // nama method
+
+          // Fitur kedua: pengali damage (method float tanpa argumen). Kosongkan DMG_CLASS untuk mematikan.
+          #define DMG_NS ""
+          #define DMG_CLASS ""
+          #define DMG_METHOD ""
+
+          // Pemindai otomatis: saat game jalan, daftar method yang namanya mengandung kata ini
+          // ditulis ke logcat (tag ModMenu) dan ke files/scan.txt. Kosongkan untuk mematikan.
+          #define SCAN_KEYWORDS "speed,damage,atk,attack"
+          MM_EOF
+          cat > module/module.prop <<'MM_EOF'
+          id=zygisk_modmenu_gt_a16
+          name=Guardian Tales Mod Menu (Android 16)
+          version=v1
+          versionCode=1
+          author=Daffa
+          description=Zygisk ImGui overlay, input via UnityPlayer JNI hook
+          MM_EOF
+          cat > module/customize.sh <<'MM_EOF'
+          #!/system/bin/sh
+          ui_print "- Zygisk Mod Menu: butuh Zygisk Next / ReZygisk / NeoZygisk aktif"
+          ui_print "- Reboot setelah install"
+          MM_EOF
+          cat > module/META-INF/com/google/android/update-binary <<'MM_EOF'
+          #!/sbin/sh
+          umask 022
+          OUTFD=$2
+          ZIPFILE=$3
+          mount /data 2>/dev/null
+          [ -f /data/adb/magisk/util_functions.sh ] && . /data/adb/magisk/util_functions.sh && install_module
+          exit 0
+          MM_EOF
+          cat > module/META-INF/com/google/android/updater-script <<'MM_EOF'
+          #MAGISK
+          MM_EOF
+      - name: Ambil dependensi
+        run: |
+          git clone --depth 1 --branch v1.91.5 https://github.com/ocornut/imgui.git third_party/imgui
+          git clone --depth 1 https://github.com/jmpews/Dobby.git third_party/Dobby
+          curl -fL -o jni/zygisk.hpp https://raw.githubusercontent.com/topjohnwu/zygisk-module-sample/master/module/jni/zygisk.hpp
+      - name: Build arm64
+        run: |
+          cmake -S . -B build -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j4
+          mkdir -p module/zygisk
+          cp build/libmodmenu.so module/zygisk/arm64-v8a.so
+          cd module && zip -r ../ModMenu-A16.zip .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ModMenu-A16
+          path: ModMenu-A16.zip
